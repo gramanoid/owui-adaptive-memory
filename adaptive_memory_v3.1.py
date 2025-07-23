@@ -1495,16 +1495,16 @@ Your output must be valid JSON only. No additional text.""",
                     bank_list_str = "\n".join([f"- {bank} {'(Default)' if bank == default_bank else ''}" for bank in allowed_banks])
                     response_msg = f"**Available Memory Banks:**\n{bank_list_str}"
                     await self._safe_emit(__event_emitter__, {"type": "info", "content": response_msg})
-                    body["messages"] = [] # Prevent LLM call
-                    body["prompt"] = "Command executed." # Placeholder for UI
+                    # Provide only user message to prevent empty content extraction in OpenWebUI's memory system
+                    # Don't include assistant message to avoid Gemini's "end with user role" requirement
+                    body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                     body["bypass_prompt_processing"] = True # Signal to skip further processing
                     return body
                 except Exception as e:
                     logger.error(f"Error handling /memory list_banks: {e}")
                     await self._safe_emit(__event_emitter__, {"type": "error", "content": "Failed to list memory banks."})
-                    # Allow fall through maybe? Or block? Let's block.
-                    body["messages"] = []
-                    body["prompt"] = "Error executing command." # Placeholder for UI
+                    # Provide only user message to prevent empty content extraction, avoid assistant message
+                    body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                     body["bypass_prompt_processing"] = True
                     return body
 
@@ -1565,8 +1565,7 @@ Your output must be valid JSON only. No additional text.""",
                     self._increment_error_counter("assign_bank_cmd_error")
 
                 # Always bypass LLM after handling command
-                body["messages"] = []
-                body["prompt"] = "Command executed." # Placeholder
+                body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                 body["bypass_prompt_processing"] = True
                 return body
 
@@ -1577,8 +1576,7 @@ Your output must be valid JSON only. No additional text.""",
                 # Remember to add command handlers here based on other implemented features
                 logger.info(f"Handling generic /memory command stub for user {user_id}: {final_message}")
                 await self._safe_emit(__event_emitter__, {"type": "info", "content": f"Memory command '{final_message}' received (implementation pending)."})
-                body["messages"] = []
-                body["prompt"] = "Memory command received." # Placeholder
+                body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                 body["bypass_prompt_processing"] = True
                 return body
 
@@ -1587,8 +1585,7 @@ Your output must be valid JSON only. No additional text.""",
                  logger.info(f"Handling /note command stub for user {user_id}: {final_message}")
                  # Implement logic for Feature 6 (Scratchpad)
                  await self._safe_emit(__event_emitter__, {"type": "info", "content": f"Note command '{final_message}' received (implementation pending)."})
-                 body["messages"] = []
-                 body["prompt"] = "Note command received." # Placeholder
+                 body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                  body["bypass_prompt_processing"] = True
                  return body
 
@@ -1648,6 +1645,11 @@ Your output must be valid JSON only. No additional text.""",
         # This was a source of many subtle bugs
         body_copy = copy.deepcopy(body)
 
+        # Skip processing if this was a command (bypass flag set in inlet)
+        if body_copy.get("bypass_prompt_processing"):
+            logger.debug("Skipping memory processing due to bypass_prompt_processing flag (command handled in inlet)")
+            return body_copy
+
         # Skip processing if user is not authenticated
         if not __user__:
             logger.warning("No user information available - skipping memory processing")
@@ -1692,6 +1694,11 @@ Your output must be valid JSON only. No additional text.""",
                          message_history_for_context = messages_copy[start_index:user_msg_index]
 
             if last_user_message_content:
+                 # Skip memory processing if this is a command
+                 if last_user_message_content.strip().startswith("/"):
+                     logger.debug(f"Skipping memory processing for command: {last_user_message_content.strip()}")
+                     return body_copy
+                     
                  logger.info(f"Starting memory processing in outlet for user message: {last_user_message_content[:60]}...")
                  # Use asyncio.create_task for non-blocking processing
                  # Reload valves inside _process_user_memories ensures latest config
@@ -1716,18 +1723,22 @@ Your output must be valid JSON only. No additional text.""",
 
         # Process the response content for injecting memories
         try:
-            # Get relevant memories for context injection on next interaction
-            memories = await self.get_relevant_memories(
-                current_message=last_user_message_content or "", # Use the variable holding the user message
-                user_id=user_id,
-                user_timezone=user_timezone,
-            )
+            # Skip memory retrieval if this is a command
+            if last_user_message_content and last_user_message_content.strip().startswith("/"):
+                logger.debug(f"Skipping memory retrieval for command: {last_user_message_content.strip()}")
+            else:
+                # Get relevant memories for context injection on next interaction
+                memories = await self.get_relevant_memories(
+                    current_message=last_user_message_content or "", # Use the variable holding the user message
+                    user_id=user_id,
+                    user_timezone=user_timezone,
+                )
 
-            # If we found relevant memories and the user wants to see them
-            if memories and self.valves.show_memories:
-                # Inject memories into the context for the next interaction
-                self._inject_memories_into_context(body_copy, memories)
-                logger.debug(f"Injected {len(memories)} memories into context")
+                # If we found relevant memories and the user wants to see them
+                if memories and self.valves.show_memories:
+                    # Inject memories into the context for the next interaction
+                    self._inject_memories_into_context(body_copy, memories)
+                    logger.debug(f"Injected {len(memories)} memories into context")
         except Exception as e:
             logger.error(
                 f"Error processing memories for context: {e}\n{traceback.format_exc()}"
@@ -1735,7 +1746,8 @@ Your output must be valid JSON only. No additional text.""",
 
         # Add confirmation message if memories were processed
         try:
-            if user_valves.show_status:
+            # Skip confirmation message for commands
+            if user_valves.show_status and not (last_user_message_content and last_user_message_content.strip().startswith("/")):
                 await self._add_confirmation_message(body_copy)
         except Exception as e:
             logger.error(f"Error adding confirmation message: {e}")
