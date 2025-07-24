@@ -1397,6 +1397,38 @@ Your output must be valid JSON only. No additional text.""",
             )
         return self._aiohttp_session
 
+    def _is_command(self, message_content: str) -> bool:
+        """
+        Check if a message is a command.
+        
+        Args:
+            message_content: The message content to check
+            
+        Returns:
+            bool: True if the message is a command, False otherwise
+        """
+        if not message_content:
+            return False
+        return message_content.strip().startswith("/")
+
+    def _get_last_user_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Extract the last user message from a messages array.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            The content of the last user message, or None if not found
+        """
+        if not messages:
+            return None
+            
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and msg.get("content"):
+                return msg.get("content")
+        return None
+
     async def inlet(
         self,
         body: Dict[str, Any],
@@ -1470,7 +1502,7 @@ Your output must be valid JSON only. No additional text.""",
         final_message = None
         # 1) Explicit stream=False (non-streaming completion requests)
         if body.get("stream") is False and body.get("messages"):
-            final_message = body["messages"][-1].get("content")
+            final_message = self._get_last_user_message(body["messages"])
 
         # 2) Streaming mode – grab final message when "done" flag arrives
         elif body.get("stream") is True and body.get("done", False):
@@ -1478,13 +1510,15 @@ Your output must be valid JSON only. No additional text.""",
 
         # 3) Fallback – many WebUI front-ends don't set a "stream" key at all.
         if final_message is None and body.get("messages"):
-            final_message = body["messages"][-1].get("content")
+            final_message = self._get_last_user_message(body["messages"])
 
         # --- Command Handling ---
         # Check if the final message is a command before processing memories
-        if final_message and final_message.strip().startswith("/"):
+        if final_message and self._is_command(final_message):
             command_parts = final_message.strip().split()
             command = command_parts[0].lower()
+
+            logger.info(f"Processing command: {final_message.strip()} for user {user_id}")
 
             # --- /memory list_banks Command --- NEW
             if command == "/memory" and len(command_parts) >= 2 and command_parts[1].lower() == "list_banks":
@@ -1495,17 +1529,15 @@ Your output must be valid JSON only. No additional text.""",
                     bank_list_str = "\n".join([f"- {bank} {'(Default)' if bank == default_bank else ''}" for bank in allowed_banks])
                     response_msg = f"**Available Memory Banks:**\n{bank_list_str}"
                     await self._safe_emit(__event_emitter__, {"type": "info", "content": response_msg})
-                    body["messages"] = [] # Prevent LLM call
-                    body["prompt"] = "Command executed." # Placeholder for UI
-                    body["bypass_prompt_processing"] = True # Signal to skip further processing
+                    # Provide only user message to prevent empty content extraction in OpenWebUI's memory system
+                    # Don't include assistant message to avoid Gemini's "end with user role" requirement
+                    body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                     return body
                 except Exception as e:
                     logger.error(f"Error handling /memory list_banks: {e}")
                     await self._safe_emit(__event_emitter__, {"type": "error", "content": "Failed to list memory banks."})
-                    # Allow fall through maybe? Or block? Let's block.
-                    body["messages"] = []
-                    body["prompt"] = "Error executing command." # Placeholder for UI
-                    body["bypass_prompt_processing"] = True
+                    # Provide only user message to prevent empty content extraction, avoid assistant message
+                    body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                     return body
 
             # --- /memory assign_bank Command --- NEW
@@ -1565,9 +1597,7 @@ Your output must be valid JSON only. No additional text.""",
                     self._increment_error_counter("assign_bank_cmd_error")
 
                 # Always bypass LLM after handling command
-                body["messages"] = []
-                body["prompt"] = "Command executed." # Placeholder
-                body["bypass_prompt_processing"] = True
+                body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                 return body
 
             # --- Other /memory commands (Placeholder/Example - Adapt as needed) ---
@@ -1577,9 +1607,7 @@ Your output must be valid JSON only. No additional text.""",
                 # Remember to add command handlers here based on other implemented features
                 logger.info(f"Handling generic /memory command stub for user {user_id}: {final_message}")
                 await self._safe_emit(__event_emitter__, {"type": "info", "content": f"Memory command '{final_message}' received (implementation pending)."})
-                body["messages"] = []
-                body["prompt"] = "Memory command received." # Placeholder
-                body["bypass_prompt_processing"] = True
+                body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                 return body
 
             # --- /note command (Placeholder/Example) ---
@@ -1587,9 +1615,7 @@ Your output must be valid JSON only. No additional text.""",
                  logger.info(f"Handling /note command stub for user {user_id}: {final_message}")
                  # Implement logic for Feature 6 (Scratchpad)
                  await self._safe_emit(__event_emitter__, {"type": "info", "content": f"Note command '{final_message}' received (implementation pending)."})
-                 body["messages"] = []
-                 body["prompt"] = "Note command received." # Placeholder
-                 body["bypass_prompt_processing"] = True
+                 body["messages"] = [{"role": "user", "content": f"Command: {final_message}"}]
                  return body
 
         # --- Memory Injection --- #
@@ -1648,6 +1674,17 @@ Your output must be valid JSON only. No additional text.""",
         # This was a source of many subtle bugs
         body_copy = copy.deepcopy(body)
 
+        # Check if the last user message was a command (skip memory processing for commands)
+        try:
+            messages = body_copy.get("messages", [])
+            last_user_message = self._get_last_user_message(messages)
+            
+            if last_user_message and self._is_command(last_user_message):
+                logger.info(f"Skipping memory processing for command: {last_user_message.strip()}")
+                return body_copy
+        except Exception as e:
+            logger.warning(f"Error in command detection: {e}")
+
         # Skip processing if user is not authenticated
         if not __user__:
             logger.warning("No user information available - skipping memory processing")
@@ -1676,10 +1713,8 @@ Your output must be valid JSON only. No additional text.""",
             messages_copy = copy.deepcopy(body_copy.get("messages", []))
             if messages_copy:
                  # Find the actual last user message in the history included in the body
-                 for msg in reversed(messages_copy):
-                     if msg.get("role") == "user" and msg.get("content"):
-                         last_user_message_content = msg.get("content")
-                         break
+                 last_user_message_content = self._get_last_user_message(messages_copy)
+                 
                  # Get up to N messages *before* the last user message for context
                  if last_user_message_content:
                      user_msg_index = -1
@@ -1735,6 +1770,7 @@ Your output must be valid JSON only. No additional text.""",
 
         # Add confirmation message if memories were processed
         try:
+            # Add confirmation message (commands are already filtered out by bypass flag)
             if user_valves.show_status:
                 await self._add_confirmation_message(body_copy)
         except Exception as e:
