@@ -1411,6 +1411,24 @@ Your output must be valid JSON only. No additional text.""",
             return False
         return message_content.strip().startswith("/")
 
+    def _get_last_user_message(self, messages: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Extract the last user message from a messages array.
+        
+        Args:
+            messages: List of message dictionaries
+            
+        Returns:
+            The content of the last user message, or None if not found
+        """
+        if not messages:
+            return None
+            
+        for msg in reversed(messages):
+            if msg.get("role") == "user" and msg.get("content"):
+                return msg.get("content")
+        return None
+
     async def inlet(
         self,
         body: Dict[str, Any],
@@ -1484,7 +1502,7 @@ Your output must be valid JSON only. No additional text.""",
         final_message = None
         # 1) Explicit stream=False (non-streaming completion requests)
         if body.get("stream") is False and body.get("messages"):
-            final_message = body["messages"][-1].get("content")
+            final_message = self._get_last_user_message(body["messages"])
 
         # 2) Streaming mode – grab final message when "done" flag arrives
         elif body.get("stream") is True and body.get("done", False):
@@ -1492,7 +1510,7 @@ Your output must be valid JSON only. No additional text.""",
 
         # 3) Fallback – many WebUI front-ends don't set a "stream" key at all.
         if final_message is None and body.get("messages"):
-            final_message = body["messages"][-1].get("content")
+            final_message = self._get_last_user_message(body["messages"])
 
         # --- Command Handling ---
         # Check if the final message is a command before processing memories
@@ -1500,8 +1518,7 @@ Your output must be valid JSON only. No additional text.""",
             command_parts = final_message.strip().split()
             command = command_parts[0].lower()
 
-            # Set bypass flag early for all commands
-            body["bypass_prompt_processing"] = True
+            logger.info(f"Processing command: {final_message.strip()} for user {user_id}")
 
             # --- /memory list_banks Command --- NEW
             if command == "/memory" and len(command_parts) >= 2 and command_parts[1].lower() == "list_banks":
@@ -1657,10 +1674,16 @@ Your output must be valid JSON only. No additional text.""",
         # This was a source of many subtle bugs
         body_copy = copy.deepcopy(body)
 
-        # Skip processing if this was a command (bypass flag set in inlet)
-        if body_copy.get("bypass_prompt_processing"):
-            logger.debug("Skipping memory processing due to bypass_prompt_processing flag (command handled in inlet)")
-            return body_copy
+        # Check if the last user message was a command (skip memory processing for commands)
+        try:
+            messages = body_copy.get("messages", [])
+            last_user_message = self._get_last_user_message(messages)
+            
+            if last_user_message and self._is_command(last_user_message):
+                logger.info(f"Skipping memory processing for command: {last_user_message.strip()}")
+                return body_copy
+        except Exception as e:
+            logger.warning(f"Error in command detection: {e}")
 
         # Skip processing if user is not authenticated
         if not __user__:
@@ -1690,10 +1713,8 @@ Your output must be valid JSON only. No additional text.""",
             messages_copy = copy.deepcopy(body_copy.get("messages", []))
             if messages_copy:
                  # Find the actual last user message in the history included in the body
-                 for msg in reversed(messages_copy):
-                     if msg.get("role") == "user" and msg.get("content"):
-                         last_user_message_content = msg.get("content")
-                         break
+                 last_user_message_content = self._get_last_user_message(messages_copy)
+                 
                  # Get up to N messages *before* the last user message for context
                  if last_user_message_content:
                      user_msg_index = -1
